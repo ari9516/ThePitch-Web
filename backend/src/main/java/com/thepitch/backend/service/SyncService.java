@@ -17,11 +17,12 @@ import java.net.http.HttpResponse;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * SyncService — fetches Premier League data from football-data.org
- * and saves teams + matches to Neon PostgreSQL.
+ * SyncService — fetches Premier League data from football-data.org,
+ * saves teams + matches to Neon PostgreSQL, and recalculates ELO ratings.
  */
 @Service
 public class SyncService {
@@ -38,6 +39,9 @@ public class SyncService {
     @Autowired
     private MatchRepository matchRepository;
 
+    @Autowired
+    private EloService eloService;
+
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final ObjectMapper mapper   = new ObjectMapper();
 
@@ -49,11 +53,14 @@ public class SyncService {
         try {
             int teamsCount   = syncTeams();
             int matchesCount = syncMatches();
+            int eloUpdated   = recalculateElo();
 
             result.put("success", true);
             result.put("teams",   teamsCount);
             result.put("matches", matchesCount);
-            result.put("message", "Sync complete: " + teamsCount + " teams, " + matchesCount + " matches");
+            result.put("eloUpdated", eloUpdated);
+            result.put("message", "Sync complete: " + teamsCount + " teams, " +
+                matchesCount + " matches, ELO recalculated for " + eloUpdated + " matches");
 
         } catch (Exception e) {
             result.put("success", false);
@@ -112,11 +119,9 @@ public class SyncService {
             try {
                 int matchId = m.get("id").asInt();
 
-                // Get home/away team IDs
                 int homeTeamId = m.get("homeTeam").get("id").asInt();
                 int awayTeamId = m.get("awayTeam").get("id").asInt();
 
-                // Only save if both teams exist in our DB
                 Team homeTeam = teamRepository.findById(homeTeamId).orElse(null);
                 Team awayTeam = teamRepository.findById(awayTeamId).orElse(null);
                 if (homeTeam == null || awayTeam == null) continue;
@@ -127,20 +132,17 @@ public class SyncService {
                 match.setAwayTeam(awayTeam);
                 match.setLeagueId(LEAGUE_ID);
 
-                // Parse date
                 String utcDate = m.get("utcDate").asText();
                 match.setMatchDate(LocalDateTime.parse(
                     utcDate, DateTimeFormatter.ISO_DATE_TIME
                 ));
 
-                // Status
                 String status = m.get("status").asText();
                 if ("FINISHED".equals(status))   match.setStatus("FINISHED");
                 else if ("TIMED".equals(status) || "SCHEDULED".equals(status))
                                                   match.setStatus("SCHEDULED");
                 else                              match.setStatus(status);
 
-                // Score
                 JsonNode score = m.get("score");
                 if (score != null) {
                     JsonNode full = score.get("fullTime");
@@ -156,12 +158,51 @@ public class SyncService {
                 count++;
 
             } catch (Exception e) {
-                // Skip problematic match, continue
                 System.err.println("Skipping match: " + e.getMessage());
             }
         }
 
         return count;
+    }
+
+    // ── Recalculate ELO from all finished matches (chronological order) ──────
+
+    private int recalculateElo() {
+        // Reset all teams to 1500 before recalculating — prevents ELO
+        // from compounding infinitely on repeated syncs
+        List<Team> allTeams = teamRepository.findAll();
+        for (Team t : allTeams) {
+            t.setEloRating(1500);
+            teamRepository.save(t);
+        }
+
+        List<Match> allMatches = matchRepository.findAll();
+        allMatches.sort((a, b) -> {
+            if (a.getMatchDate() == null || b.getMatchDate() == null) return 0;
+            return a.getMatchDate().compareTo(b.getMatchDate());
+        });
+
+        int updated = 0;
+        for (Match m : allMatches) {
+            if (!m.isFinished() || m.getHomeScore() == null || m.getAwayScore() == null) continue;
+
+            Team home = teamRepository.findById(m.getHomeTeam().getTeamId()).orElse(null);
+            Team away = teamRepository.findById(m.getAwayTeam().getTeamId()).orElse(null);
+            if (home == null || away == null) continue;
+
+            m.setHomeTeam(home);
+            m.setAwayTeam(away);
+
+            int[] newElo = eloService.calculateNewRatings(m);
+            home.setEloRating(newElo[0]);
+            away.setEloRating(newElo[1]);
+
+            teamRepository.save(home);
+            teamRepository.save(away);
+            updated++;
+        }
+
+        return updated;
     }
 
     // ── HTTP helper ───────────────────────────────────────────────────────────
